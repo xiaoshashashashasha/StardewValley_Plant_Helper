@@ -1,5 +1,5 @@
 import os
-import time
+import tools
 import chromadb
 import json
 import google.generativeai as genai
@@ -49,22 +49,94 @@ def retrieve_and_rerank(query: str, top_k1=10, top_k2=4):
     return [chunk for chunk, _ in chunk_with_scores[:top_k2]]
 
 
+# ---函数调用---
+def call_tool(tool_call):
+    function_name = tool_call.name
+    args = {k: v for k, v in tool_call.args.items()}
+
+    # 函数名到实际函数的映射
+    available_functions = {
+        "get_crops_by_sellprice": tools.get_crops_by_sellprice,
+        "get_crops_by_dailyrevenue": tools.get_crops_by_dailyrevenue,
+        "get_crops_by_seedprice": tools.get_crops_by_seedprice,
+        "get_crops_by_growtime": tools.get_crops_by_growtime,
+    }
+
+    if function_name in available_functions:
+        return available_functions[function_name](**args)
+
+
 # ---回答方法---
-def generate_answer(query: str, chunks: List[str]):
-    prompt = f"""你是一位星露谷农作物种植助手，请根据用户问题和下列片段中的有用信息生成准确回答。
+def generate_answer(query: str):
+    prompt = f"""你是一位星露谷农作物种植助手，请根据用户问题和提供片段中的有用信息生成准确回答。回答格式请尽量简洁，美观。
+    不要编造信息，请从工具库中选择合适的工具来获取信息。若无需其他信息，则直接回答。若所获信息无法解决问题，则直接说明无法解决。"""
 
-    用户问题:{query}
+    # 构造第一轮消息
+    messages = [
+        {"role": "user", "parts": [{"text": prompt}]},
+        {"role": "user", "parts": [{"text": f"用户问题: {query}\n\n"}]}
+    ]
 
-    相关片段:
-    {"\n\n".join(chunks)}
+    # 获取响应
+    model = genai.GenerativeModel("gemini-2.5-flash", tools=tools.TOOLS_LIST)
+    response = model.generate_content(messages)
 
-    请基于以上内容作答，不要编造信息。"""
+    # 检查响应是否包含函数调用
+    try:
+        tool_call = response.candidates[0].content.parts[0].function_call
 
-    model = genai.GenerativeModel("gemini-2.5-flash")
+        # 若为函数调用
+        if tool_call:
+            print("get function calling\n")
 
-    response = model.generate_content(prompt)
+            # 若为RAG检索请求
+            if tool_call.name == "RAGCalling":
+                print("RAG Search\n")
 
-    return response.text
+                # 执行召回、重排过程
+                retrieved_chunks = retrieve_and_rerank(user_query)
+                messages.append({"role": "user", "parts": [{"text": f"可用片段如下:{retrieved_chunks}"}]})
+
+                print("生成回答，相关分片为:\n")
+                i = 0
+                for chunk in retrieved_chunks:
+                    print(f"分片{i}:{chunk}\n")
+                    i += 1
+
+                # 根据RAG片段生成最终回答
+                final_response = model.generate_content(messages)
+                return final_response.text
+
+            # 若为正常函数调用
+            else:
+                print("Function Search\n")
+
+                # 执行函数并获取结果
+                tool_output = call_tool(tool_call)
+
+                # 构造函数响应消息格式
+                function_response_part = {
+                    "function_response": {
+                        "name": tool_call.name,
+                        "response": {
+                            "content": tool_output
+                        }
+                    }
+                }
+                messages.append({"role": "function", "parts": [function_response_part]})
+
+                # 将函数结果传给模型生成最终回答
+                final_response = model.generate_content(messages)
+                return final_response.text
+
+        # 若无需额外信息来源
+        else:
+            # 直接返回回答
+            print(response.text)
+            return response.text
+    except (AttributeError, IndexError):
+        if response.text:
+            return response.text
 
 
 # ---消息持久化---
@@ -88,7 +160,16 @@ def save_chat_history(messages):
 # ---UI界面---
 st.set_page_config(page_title="星露谷物语小助手", page_icon="🌱")
 st.title("🌱星露谷物语农作物小助手")
-st.markdown("输入你的农作物相关问题，我将根据本地知识库为你提供准确的攻略信息。")
+col1, col2 = st.columns([4,1])
+with col1:
+    st.markdown("输入你的农作物相关问题，我将根据本地知识库为你提供准确的攻略信息。")
+
+with col2:
+    # 添加清空历史的按钮
+    if st.button("清空历史消息"):
+        st.session_state.messages = []
+        save_chat_history([])
+        st.rerun()
 
 # 初始化模型并连接知识库
 with st.spinner("正在加载Embedding和Cross-Encoder模型..."):
@@ -108,36 +189,29 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-        # 显示回答所用分片
-        if message["role"] == "assistant" and "chunks" in message:
-            with st.expander("查看用于生成答案的上下文"):
-                for i, chunk in enumerate(message["chunks"]):
-                    st.write(f"**分片 {i + 1}:**")
-                    st.write(chunk)
-
 # 监听用户输入
 if user_query := st.chat_input("在这里输入你的问题..."):
-    # 1. 在会话中添加新用户消息
+    # 在会话中添加新用户消息
     st.session_state.messages.append({"role": "user", "content": user_query})
 
-    # 2. 渲染新用户消息
+    # 渲染新用户消息
     with st.chat_message("user"):
         st.markdown(user_query)
 
-    # 3. 渲染助手消息
+    # 渲染助手消息
     with st.chat_message("assistant"):
         with st.spinner("正在搜索和生成回答..."):
-            retrieved_chunks = retrieve_and_rerank(user_query)
-            answer = generate_answer(user_query, retrieved_chunks)
+            # 调用回答方法
+            answer = generate_answer(user_query)
 
-            # 将回答和分片保存到会话
+            # 将回答保存到会话
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": answer,
-                "chunks": retrieved_chunks
             })
 
             # 立即保存
             save_chat_history(st.session_state.messages)
 
         st.rerun()
+
