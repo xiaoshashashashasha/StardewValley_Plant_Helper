@@ -4,7 +4,7 @@ import google.generativeai as genai
 
 from typing import List
 from sentence_transformers import CrossEncoder
-from Week02.AI_Helper_Proto.setUp import embed_chunk
+from AI_Helper_Proto.setUp import embed_chunk
 
 chromadb_client = chromadb.PersistentClient("AI_Helper_Proto/zuowu.db")
 
